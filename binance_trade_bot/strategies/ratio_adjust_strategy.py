@@ -7,7 +7,7 @@ from sqlalchemy.orm import Session, aliased
 from sqlalchemy.sql.expression import and_
 
 from binance_trade_bot.auto_trader import AutoTrader
-from binance_trade_bot.database import Pair, Coin
+from binance_trade_bot.database import Pair, Coin, Trade
 
 class Strategy(AutoTrader):
     def initialize(self):
@@ -191,3 +191,55 @@ class Strategy(AutoTrader):
                     pair.ratio = cumulative_ratio
 
             self.logger.info(f"Finished ratio init...")
+
+    def _jump_to_best_coin(self, coin: Coin, coin_price: float, excluded_coins: List[Coin] = []):
+        """
+        Given a coin, search for a coin to jump to
+        """
+        ratio_dict, prices = self._get_ratios(coin, coin_price, excluded_coins)
+
+        # keep only ratios bigger than zero
+        ratio_dict = {k: v for k, v in ratio_dict.items() if v > 0}
+
+        # if we have any viable options, pick the one with the biggest ratio
+        if ratio_dict:
+            if len(ratio_dict) > 1:
+                pairs = sorted(ratio_dict.items(), key=lambda x: x[1], reverse=True)
+            else:
+                pairs = [max(ratio_dict, key=ratio_dict.get)]
+
+            for pair in pairs:
+
+
+                if isinstance(pair, tuple):
+                    best_pair = pair[0]
+                else:
+                    best_pair = pair
+
+                from_coin_balance = self.manager.get_currency_balance(best_pair.from_coin.symbol)
+                from_coin_price = self.manager.get_ticker_price(best_pair.from_coin.symbol + self.config.BRIDGE.symbol)
+                to_coin_price = self.manager.get_ticker_price(best_pair.to_coin.symbol + self.config.BRIDGE.symbol)
+
+                raw_quantity = (from_coin_balance * from_coin_price) / to_coin_price
+                order_quantity = round(raw_quantity - (raw_quantity * 0.004), 4)
+
+                session: Session
+                with self.db.db_session() as session:
+                    try:
+                        trade = session.query(Trade).filter(Trade.alt_coin_id == best_pair.to_coin.symbol).filter(Trade.selling == False).order_by(Trade.datetime.desc()).limit(1).one().info()
+                        #print(f"{trade}")
+                        if trade:
+                           last_bought_amount = float(trade['alt_trade_amount'])
+                    except:
+                      last_bought_amount = 0
+
+                #print(f"{best_pair.from_coin.symbol} - {from_coin_balance} - {from_coin_price} -> {best_pair.to_coin.symbol} - {order_quantity} - {to_coin_price} | {last_bought_amount} \n")
+
+
+                if order_quantity >= last_bought_amount:
+                    #self.logger.debug(f"Will be jumping from {coin} to {best_pair.to_coin_id}")
+                    self.transaction_through_bridge(best_pair, coin_price, prices[best_pair.to_coin_id])
+                    break
+                else:
+                    self.logger.info(f"Skipping Negative trade for {best_pair.to_coin.symbol}")
+                    continue

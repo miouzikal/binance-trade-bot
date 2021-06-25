@@ -220,6 +220,7 @@ class MockBinanceManager(BinanceAPIManager):
             trade = Trade(from_coin, to_coin, False)
             trade.datetime = self.datetime
             trade.state = TradeState.COMPLETE
+            trade.alt_trade_amount = float(self.balances[origin_symbol])
             session.add(trade)
             # Flush so that SQLAlchemy fills in the id column
             session.flush()
@@ -278,7 +279,7 @@ class MockBinanceManager(BinanceAPIManager):
 
 class MockDatabase(Database):
     def __init__(self, logger: Logger, config: Config):
-        super().__init__(logger, config, "sqlite:///", True)
+        super().__init__(logger, config, "sqlite:///data/backtest_crypto_trading.db", False)
 
     def log_scout(self, pair: Pair, target_ratio: float, current_coin_price: float, other_coin_price: float):
         pass
