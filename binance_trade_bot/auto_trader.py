@@ -22,7 +22,7 @@ class AutoTrader:
     def initialize(self):
         self.initialize_trade_thresholds()
 
-    def transaction_through_bridge(self, pair: Pair, sell_price: float, buy_price: float):
+    def transaction_through_bridge(self, pair: Pair, sell_price: float, buy_price: float, minimum_quantity: float):
         """
         Jump from the source coin to the destination coin through bridge coin
         """
@@ -40,7 +40,7 @@ class AutoTrader:
             self.logger.info("Couldn't sell, going back to scouting mode...")
             return None
 
-        result = self.manager.buy_alt(pair.to_coin, self.config.BRIDGE, buy_price)
+        result = self.manager.buy_alt(pair.to_coin, self.config.BRIDGE, buy_price, minimum_quantity)
         if result is not None:
             self.db.set_current_coin(pair.to_coin)
             price = result.price
@@ -184,7 +184,7 @@ class AutoTrader:
                 if bridge_balance > self.manager.get_min_notional(coin.symbol, self.config.BRIDGE.symbol):
                     self.logger.info(f"Will be purchasing {coin} using bridge coin")
                     result = self.manager.buy_alt(
-                        coin, self.config.BRIDGE, self.manager.get_sell_price(coin + self.config.BRIDGE)
+                        coin, self.config.BRIDGE, self.manager.get_sell_price(coin + self.config.BRIDGE, 0)
                     )
                     if result is not None:
                         self.db.set_current_coin(coin)

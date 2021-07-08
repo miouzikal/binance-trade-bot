@@ -293,8 +293,8 @@ class BinanceAPIManager:
 
         return False
 
-    def buy_alt(self, origin_coin: Coin, target_coin: Coin, buy_price: float) -> BinanceOrder:
-        return self.retry(self._buy_alt, origin_coin, target_coin, buy_price)
+    def buy_alt(self, origin_coin: Coin, target_coin: Coin, buy_price: float, minimum_quantity: float) -> BinanceOrder:
+        return self.retry(self._buy_alt, origin_coin, target_coin, buy_price, minimum_quantity)
 
     def _buy_quantity(
         self, origin_symbol: str, target_symbol: str, target_balance: float = None, from_coin_price: float = None
@@ -331,7 +331,7 @@ class BinanceAPIManager:
             params["quoteOrderQty"] = self.float_as_decimal_str(quote_quantity)
         return self.binance_client.create_order(**params)
 
-    def _buy_alt(self, origin_coin: Coin, target_coin: Coin, buy_price: float):  # pylint: disable=too-many-locals
+    def _buy_alt(self, origin_coin: Coin, target_coin: Coin, buy_price: float, minimum_quantity: float):  # pylint: disable=too-many-locals
         """
         Buy altcoin
         """
@@ -353,6 +353,10 @@ class BinanceAPIManager:
         trade_log = self.db.start_trade_log(origin_coin, target_coin, False)
 
         order_quantity = self._buy_quantity(origin_symbol, target_symbol, target_balance, from_coin_price)
+        if order_quantity < minimum_quantity:
+            self.logger.info("Unable to buy minimum amount, cancel buy")
+            return None
+
         self.logger.info(f"BUY QTY {order_quantity} of <{origin_symbol}>")
 
         # Try to buy until successful

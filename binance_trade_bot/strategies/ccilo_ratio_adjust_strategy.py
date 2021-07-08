@@ -1,7 +1,9 @@
 from collections import defaultdict
 import random
 import sys
+import math
 from datetime import datetime, timedelta
+
 from typing import List
 
 from sqlalchemy.orm import Session, aliased
@@ -12,22 +14,16 @@ from binance_trade_bot.database import Pair, Coin, Trade
 
 class Strategy(AutoTrader):
     def initialize(self):
-        self.logger.info(f"CAUTION: The ratio_adjust strategy is still work in progress and can lead to losses! Use this strategy only if you know what you are doing, did alot of backtests and can live with possible losses.")
-
-        if self.config.ACCEPT_LOSSES != True:
-            self.logger.error("You need accept losses by setting accept_losses=true in the user.cfg or setting the enviroment variable ACCEPT_LOSSES to true in order to use this strategy!")
-            raise Exception()
-
         super().initialize()
         self.initialize_current_coin()
         self.reinit_threshold = self.manager.now().replace(second=0, microsecond=0)
-        self.logger.info(f"Ratio adjust weight: {self.config.RATIO_ADJUST_WEIGHT}")
-    
+        self.logger.info(f"CAUTION: The ratio_adjust strategy is still work in progress and can lead to losses! Use this strategy only if you know what you are doing, did alot of backtests and can live with possible losses.")
+
     def scout(self):
         #check if previous buy order failed. If so, bridge scout for a new coin.
         if self.failed_buy_order:
             self.bridge_scout()
-        
+
         base_time: datetime = self.manager.now()
         allowed_idle_time = self.reinit_threshold
         if base_time >= allowed_idle_time:
@@ -64,6 +60,70 @@ class Strategy(AutoTrader):
         new_coin = super().bridge_scout()
         if new_coin is not None:
             self.db.set_current_coin(new_coin)
+
+    def _jump_to_best_coin(self, coin: Coin, coin_price: float, excluded_coins: List[Coin] = []):
+        """
+        Given a coin, search for a coin to jump to
+        """
+        ratio_dict, prices = self._get_ratios(coin, coin_price, excluded_coins)
+
+        # keep only ratios bigger than zero
+        ratio_dict = {k: v for k, v in ratio_dict.items() if v > 0}
+
+        # if we have any viable options, pick the one with the biggest ratio
+        if ratio_dict:
+            if len(ratio_dict) > 1:
+                pairs = sorted(ratio_dict.items(), key=lambda x: x[1], reverse=True)
+            else:
+                pairs = [max(ratio_dict, key=ratio_dict.get)]
+
+            for pair in pairs:
+                if isinstance(pair, tuple):
+                    best_pair = pair[0]
+                else:
+                    best_pair = pair
+
+                from_coin_balance = self.manager.get_currency_balance(best_pair.from_coin.symbol)
+                from_coin_price = self.manager.get_ticker_price(best_pair.from_coin.symbol + self.config.BRIDGE.symbol)
+                to_coin_price = self.manager.get_ticker_price(best_pair.to_coin.symbol + self.config.BRIDGE.symbol)
+
+                session: Session
+                with self.db.db_session() as session:
+                    try:
+                        trade = session.query(Trade).filter(Trade.alt_coin_id == best_pair.to_coin.symbol).filter(Trade.selling == False).order_by(Trade.datetime.desc()).limit(1).one().info()
+                        if trade:
+                           last_bought_amount = float(trade['alt_trade_amount'])
+                    except:
+                      last_bought_amount = 0
+
+                if from_coin_balance is not None and from_coin_balance * from_coin_price > self.manager.get_min_notional(best_pair.from_coin.symbol, self.config.BRIDGE.symbol):
+                    raw_bridge_balance = from_coin_balance * from_coin_price
+                    bridge_balance = raw_bridge_balance - (raw_bridge_balance * 0.002)
+                else:
+                    bridge_balance = self.manager.get_currency_balance(self.config.BRIDGE.symbol)
+
+                #print(f"STRATEGY: _buy_quantity({best_pair.from_coin.symbol}, {self.config.BRIDGE.symbol}, {bridge_balance}, {to_coin_price})")
+                order_quantity = self.manager._buy_quantity(best_pair.from_coin.symbol, self.config.BRIDGE.symbol, bridge_balance, to_coin_price)
+                if not float(order_quantity):
+                    order_quantity = 0
+
+                if last_bought_amount > 0:
+                    pct_gain = ((order_quantity - last_bought_amount) / last_bought_amount)*100
+                else:
+                    pct_gain = 0
+                if last_bought_amount > 0:
+                    pct_gain = ((order_quantity - last_bought_amount) / last_bought_amount)*100
+                else:
+                    pct_gain = 0
+
+                if order_quantity > last_bought_amount and (last_bought_amount == 0 or pct_gain > 2):
+                    self.logger.info(f"Jump | {best_pair.from_coin.symbol} -> {best_pair.to_coin.symbol} | estimated gain : {round(pct_gain,2)}%")
+                    self.transaction_through_bridge(best_pair, coin_price, prices[best_pair.to_coin_id], order_quantity)
+                    break
+                else:
+                    #self.logger.info(f"Skip | {best_pair.from_coin.symbol} -> {best_pair.to_coin.symbol} | order : ({order_quantity}) / last trade : ({last_bought_amount})")
+                    continue
+
 
     def initialize_current_coin(self):
         """
@@ -133,7 +193,7 @@ class Strategy(AutoTrader):
                     # )
                     continue
 
-                pair.ratio = (pair.ratio *self.config.RATIO_ADJUST_WEIGHT + from_coin_price / to_coin_price)  / (self.config.RATIO_ADJUST_WEIGHT + 1)
+                pair.ratio = (pair.ratio *100 + from_coin_price / to_coin_price)  / (100 + 1)
 
     def initialize_trade_thresholds(self):
         """
@@ -149,7 +209,7 @@ class Strategy(AutoTrader):
 
             price_history = {}
             base_date = self.manager.now().replace(second=0, microsecond=0)
-            start_date = base_date - timedelta(minutes=self.config.RATIO_ADJUST_WEIGHT*2)
+            start_date = base_date - timedelta(minutes=100*2)
             end_date = base_date - timedelta(minutes=1)
 
             start_date_str = start_date.strftime('%Y-%m-%d %H:%M')
@@ -160,87 +220,36 @@ class Strategy(AutoTrader):
 
                 if from_coin_symbol not in price_history.keys():
                     price_history[from_coin_symbol] = []
-                    for result in  self.manager.binance_client.get_historical_klines(f"{from_coin_symbol}{self.config.BRIDGE_SYMBOL}", "1m", start_date_str, end_date_str, limit=self.config.RATIO_ADJUST_WEIGHT*2):
+                    for result in  self.manager.binance_client.get_historical_klines(f"{from_coin_symbol}{self.config.BRIDGE_SYMBOL}", "1m", start_date_str, end_date_str, limit=100*2):
                         price = float(result[1])
                         price_history[from_coin_symbol].append(price)
 
-                for pair in group:                  
+                for pair in group:
                     to_coin_symbol = pair.to_coin.symbol
                     if to_coin_symbol not in price_history.keys():
                         price_history[to_coin_symbol] = []
-                        for result in self.manager.binance_client.get_historical_klines(f"{to_coin_symbol}{self.config.BRIDGE_SYMBOL}", "1m", start_date_str, end_date_str, limit=self.config.RATIO_ADJUST_WEIGHT*2):                           
+                        for result in self.manager.binance_client.get_historical_klines(f"{to_coin_symbol}{self.config.BRIDGE_SYMBOL}", "1m", start_date_str, end_date_str, limit=100*2):
                            price = float(result[1])
                            price_history[to_coin_symbol].append(price)
 
-                    if len(price_history[from_coin_symbol]) != self.config.RATIO_ADJUST_WEIGHT*2:
+                    if len(price_history[from_coin_symbol]) != 100*2:
                         self.logger.info(len(price_history[from_coin_symbol]))
-                        self.logger.info(f"Skip initialization. Could not fetch last {self.config.RATIO_ADJUST_WEIGHT * 2} prices for {from_coin_symbol}")
+                        self.logger.info(f"Skip initialization. Could not fetch last {100 * 2} prices for {from_coin_symbol}")
                         continue
-                    if len(price_history[to_coin_symbol]) != self.config.RATIO_ADJUST_WEIGHT*2:
-                        self.logger.info(f"Skip initialization. Could not fetch last {self.config.RATIO_ADJUST_WEIGHT * 2} prices for {to_coin_symbol}")
+                    if len(price_history[to_coin_symbol]) != 100*2:
+                        self.logger.info(f"Skip initialization. Could not fetch last {100 * 2} prices for {to_coin_symbol}")
                         continue
-                    
+
                     sma_ratio = 0.0
-                    for i in range(self.config.RATIO_ADJUST_WEIGHT):
+                    for i in range(100):
                         sma_ratio += price_history[from_coin_symbol][i] / price_history[to_coin_symbol][i]
-                    sma_ratio = sma_ratio / self.config.RATIO_ADJUST_WEIGHT
+                    sma_ratio = sma_ratio / 100
 
                     cumulative_ratio = sma_ratio
-                    for i in range(self.config.RATIO_ADJUST_WEIGHT, self.config.RATIO_ADJUST_WEIGHT * 2):
-                        cumulative_ratio = (cumulative_ratio * self.config.RATIO_ADJUST_WEIGHT + price_history[from_coin_symbol][i] / price_history[to_coin_symbol][i]) / (self.config.RATIO_ADJUST_WEIGHT + 1)
+                    for i in range(100, 100 * 2):
+                        cumulative_ratio = (cumulative_ratio * 100 + price_history[from_coin_symbol][i] / price_history[to_coin_symbol][i]) / (100 + 1)
 
                     pair.ratio = cumulative_ratio
 
             self.logger.info(f"Finished ratio init...")
 
-    def _jump_to_best_coin(self, coin: Coin, coin_price: float, excluded_coins: List[Coin] = []):
-        """
-        Given a coin, search for a coin to jump to
-        """
-        ratio_dict, prices = self._get_ratios(coin, coin_price, excluded_coins)
-
-        # keep only ratios bigger than zero
-        ratio_dict = {k: v for k, v in ratio_dict.items() if v > 0}
-
-        # if we have any viable options, pick the one with the biggest ratio
-        if ratio_dict:
-            if len(ratio_dict) > 1:
-                pairs = sorted(ratio_dict.items(), key=lambda x: x[1], reverse=True)
-            else:
-                pairs = [max(ratio_dict, key=ratio_dict.get)]
-
-            for pair in pairs:
-
-
-                if isinstance(pair, tuple):
-                    best_pair = pair[0]
-                else:
-                    best_pair = pair
-
-                from_coin_balance = self.manager.get_currency_balance(best_pair.from_coin.symbol)
-                from_coin_price = self.manager.get_ticker_price(best_pair.from_coin.symbol + self.config.BRIDGE.symbol)
-                to_coin_price = self.manager.get_ticker_price(best_pair.to_coin.symbol + self.config.BRIDGE.symbol)
-
-                raw_quantity = (from_coin_balance * from_coin_price) / to_coin_price
-                order_quantity = round(raw_quantity - (raw_quantity * 0.004), 4)
-
-                session: Session
-                with self.db.db_session() as session:
-                    try:
-                        trade = session.query(Trade).filter(Trade.alt_coin_id == best_pair.to_coin.symbol).filter(Trade.selling == False).order_by(Trade.datetime.desc()).limit(1).one().info()
-                        #print(f"{trade}")
-                        if trade:
-                           last_bought_amount = float(trade['alt_trade_amount'])
-                    except:
-                      last_bought_amount = 0
-
-                #print(f"{best_pair.from_coin.symbol} - {from_coin_balance} - {from_coin_price} -> {best_pair.to_coin.symbol} - {order_quantity} - {to_coin_price} | {last_bought_amount} \n")
-
-
-                if order_quantity >= last_bought_amount:
-                    #self.logger.debug(f"Will be jumping from {coin} to {best_pair.to_coin_id}")
-                    self.transaction_through_bridge(best_pair, coin_price, prices[best_pair.to_coin_id])
-                    break
-                else:
-                    self.logger.info(f"Skipping Negative trade for {best_pair.to_coin.symbol}")
-                    continue
