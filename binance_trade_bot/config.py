@@ -57,7 +57,7 @@ class Config:  # pylint: disable=too-few-public-methods,too-many-instance-attrib
         self.SCOUT_MULTIPLIER = float(
             os.environ.get("SCOUT_MULTIPLIER") or config.get(USER_CFG_SECTION, "scout_multiplier")
         )
-        self.SCOUT_SLEEP_TIME = int(
+        self.SCOUT_SLEEP_TIME = float(
             os.environ.get("SCOUT_SLEEP_TIME") or config.get(USER_CFG_SECTION, "scout_sleep_time")
         )
 
